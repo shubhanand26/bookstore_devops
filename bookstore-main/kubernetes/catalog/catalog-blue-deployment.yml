@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalog
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: catalog
+        version: blue
+    spec:
+      containers:
+      - name: catalog
+        image: teufelz/bookstore-catalog:latest
+        ports:
+        - containerPort: 5001
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi" 
+        env:
+        - name: DATABASE_URL
+          value: postgresql://admin:admin@postgres:5432/bookstore_db
+        livenessProbe:
+          httpGet:
+            path: /api/liveness
+            port: 5001
+          initialDelaySeconds: 30
+          periodSeconds: 10 
+          failureThreshold: 3 
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 2

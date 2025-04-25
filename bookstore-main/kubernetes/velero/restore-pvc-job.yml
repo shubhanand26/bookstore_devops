@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: restore-pvc-job
+  namespace: velero
+spec:
+  schedule: "0 * * * *"  # Runs every hour
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: velero  # Velero needs permission to restore
+          containers:
+            - name: restore-pvc
+              image: bitnami/kubectl:latest  # Uses kubectl image
+              command: ["/bin/sh", "-c", "/scripts/restore-if-pvc-deleted.sh"]
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+              resources:
+                requests:
+                  memory: "100Mi"  # Minimum memory allocated to the container
+                  cpu: "100m"      # Minimum CPU allocated to the container
+                limits:
+                  memory: "200Mi"  # Maximum memory allowed for the container
+                  cpu: "500m"      # Maximum CPU allowed for the container
+          restartPolicy: OnFailure
+          volumes:
+            - name: scripts
+              configMap:
+                name: restore-pvc-script  # Reference to the ConfigMap you created

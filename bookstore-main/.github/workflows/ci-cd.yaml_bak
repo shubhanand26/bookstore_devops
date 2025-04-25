@@ -1,0 +1,525 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main  # Trigger this pipeline when pushing to the main branch
+  pull_request:
+    branches:
+      - main  # Trigger on pull requests targeting the main branch
+
+permissions:
+  id-token: write
+
+jobs:
+  checkout-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      kubeconfig: ${{ steps.set-kubeconfig.outputs.kubeconfig }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+ 
+      - name: Save Repository as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-files
+          path: .
+ 
+      - name: Azure Login (Only Once)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+ 
+      - name: Set Kubernetes Context
+        id: set-kubeconfig
+        run: |
+          az aks get-credentials --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --name ${{ secrets.AZURE_CLUSTER_NAME }}
+          mkdir -p ~/.kube  # Ensure the directory exists
+          cat ~/.kube/config | base64 -w 0 > kubeconfig.b64  # Encode kubeconfig
+          echo "kubeconfig=$(cat kubeconfig.b64)" >> "$GITHUB_OUTPUT"
+ 
+      - name: Save kubeconfig as Artifact (Backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeconfig
+          path: kubeconfig.b64
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: checkout-and-setup
+    steps:
+      - name: Download Repository
+        uses: actions/download-artifact@v4
+        with:
+          name: repo-files
+          path: .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Install Docker Compose
+        run: |
+          sudo curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose --version  # Verify installation
+
+      - name: Build & Push Stack Images
+        run: |
+          docker-compose -f docker-compose.yml build
+          docker-compose -f docker-compose.yml push
+
+  apply-predeploy:
+    runs-on: ubuntu-latest
+    needs: checkout-and-setup
+    steps:
+      - name: Download Repository
+        uses: actions/download-artifact@v4
+        with:
+          name: repo-files
+          path: .
+
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Apply Configurations Before Deploying
+        run: |
+          kubectl apply -f kubernetes/frontend/frontend-configmap.yml
+
+      - name: Deploy Database
+        run: |
+          kubectl apply -f kubernetes/db/postgres-deployment.yml
+
+  install-velero:
+    runs-on: ubuntu-latest 
+    needs: [checkout-and-setup, apply-predeploy]
+    steps:
+      - name: Download Repository
+        uses: actions/download-artifact@v4
+        with:
+          name: repo-files
+          path: .
+
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Install Velero CLI
+        run: |
+          curl -LO https://github.com/vmware-tanzu/velero/releases/download/v1.15.2/velero-v1.15.2-linux-amd64.tar.gz
+          tar -xzvf velero-v1.15.2-linux-amd64.tar.gz
+          sudo mv velero-v1.15.2-linux-amd64/velero /usr/local/bin/
+          chmod +x /usr/local/bin/velero
+
+      - name: Install Velero in AKS using Velero CLI
+        run: |
+          velero install \
+            --provider azure \
+            --plugins velero/velero-plugin-for-microsoft-azure:v1.11.1 \
+            --bucket ${{ secrets.AZURE_VELERO_BLOB_CONTAINER }} \
+            --secret-file kubernetes/velero/credentials-velero \
+            --backup-location-config resourceGroup=${{ secrets.AZURE_VELERO_RESOURCE_GROUP }},storageAccount=${{ secrets.AZURE_VELERO_STORAGE_ACCOUNT }},subscriptionId=${{ secrets.AZURE_VELERO_SUBSCRIPTION_ID }} 
+          
+      - name: Verify Velero Installation
+        run: kubectl get pods -n velero
+
+      - name: Install Velero CRDs
+        run: |
+          kubectl apply -f velero-crds/
+
+      - name: Apply Velero Schedule
+        run: |
+          kubectl apply -f kubernetes/velero/velero-schedule.yml -n velero
+
+  helm-upgrade:
+    runs-on: ubuntu-latest
+    needs: apply-predeploy
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+    
+      - name: Helm Install 
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+
+      - name: Install or Upgrade Kubernetes Tools
+        run: |
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx --namespace ingress-nginx --create-namespace --wait
+
+  determine-target:
+    runs-on: ubuntu-latest
+    needs: helm-upgrade
+    outputs:
+      target_color: ${{ steps.set-color.outputs.target_color }}
+      idle_color: ${{ steps.set-color.outputs.idle_color }}
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Check current active version for services
+        id: set-color
+        run: |
+          CURRENT_COLOR=$(kubectl get service catalog-service -o jsonpath='{.spec.selector.version}')
+          if [ "$CURRENT_COLOR" == "blue" ]; then
+            echo "Deploying Green next..."
+            echo "target_color=green" >> $GITHUB_OUTPUT
+            echo "idle_color=blue" >> $GITHUB_OUTPUT
+          else
+            echo "Deploying Blue next..."
+            echo "target_color=blue" >> $GITHUB_OUTPUT
+            echo "idle_color=green" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-new:
+    runs-on: ubuntu-latest
+    needs: determine-target
+    steps:
+      - name: Download Repository
+        uses: actions/download-artifact@v4
+        with:
+          name: repo-files
+          path: .
+          
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Deploy new (Blue/Green) version for all services
+        run: |
+          kubectl apply -f kubernetes/catalog/catalog-${{ needs.determine-target.outputs.target_color }}-deployment.yml
+          kubectl apply -f kubernetes/cart/cart-${{ needs.determine-target.outputs.target_color }}-deployment.yml
+          kubectl apply -f kubernetes/frontend/frontend-${{ needs.determine-target.outputs.target_color }}-deployment.yml
+
+      - name: Apply Kubernetes Services
+        run: |
+          kubectl apply -f kubernetes/catalog/catalog-service.yml
+          kubectl apply -f kubernetes/cart/cart-service.yml
+          kubectl apply -f kubernetes/frontend/frontend-service.yml
+
+      - name: Apply Kubernetes HPA
+        run: |
+          kubectl apply -f kubernetes/catalog/catalog-${{ needs.determine-target.outputs.target_color }}-hpa.yml
+          kubectl apply -f kubernetes/cart/cart-${{ needs.determine-target.outputs.target_color }}-hpa.yml
+          kubectl apply -f kubernetes/frontend/frontend-${{ needs.determine-target.outputs.target_color }}-hpa.yml
+
+      - name: Apply Kubernetes Ingress
+        run: |
+          kubectl apply -f kubernetes/catalog/catalog-ingress.yml
+          kubectl apply -f kubernetes/cart/cart-ingress.yml
+          kubectl apply -f kubernetes/frontend/frontend-ingress.yml
+
+  restart-pods:
+    runs-on: ubuntu-latest
+    needs: [determine-target, build-and-push, deploy-new]
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Restart Pods to Ensure Latest Image is Pulled
+        run: |
+          kubectl rollout restart deployment/catalog-${{ needs.determine-target.outputs.target_color }}
+          kubectl rollout restart deployment/cart-${{ needs.determine-target.outputs.target_color }}
+          kubectl rollout restart deployment/frontend-${{ needs.determine-target.outputs.target_color }}
+
+  test-new:
+    runs-on: ubuntu-latest
+    needs: [determine-target, restart-pods]
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Wait for Pods to be Ready
+        run: |
+          echo "Waiting for catalog-${{ needs.determine-target.outputs.target_color }} pods to be fully running..."
+          for i in {1..10}; do
+            POD_NAME=$(kubectl get pods -l app=catalog,version=${{ needs.determine-target.outputs.target_color }} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NONE")
+            if [[ "$POD_NAME" != "NONE" && -n "$POD_NAME" ]]; then
+              echo "✅ Pod $POD_NAME is running, proceeding..."
+              echo "POD_NAME=$POD_NAME" >> $GITHUB_ENV
+              break
+            fi
+ 
+            echo "⏳ Pod not ready, retrying in 5 seconds..."
+            sleep 5
+          done
+
+      - name: Get Blue and Green Pods
+        id: get-pods
+        run: |
+          echo "Fetching Blue Pods..."
+          BLUE_POD=$(kubectl get pods -l app=catalog,version=blue --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NONE")
+          
+          echo "Fetching Green Pods..."
+          GREEN_POD=$(kubectl get pods -l app=catalog,version=green --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "NONE")
+          
+          # If Green does not exist, it's the first deployment
+          if [[ "$GREEN_POD" == "NONE" || -z "$GREEN_POD" ]]; then
+            echo "⚠️ No Green Pod found, assuming first deployment. Continuing..."
+            GREEN_POD="SKIP"
+          fi
+ 
+          if [[ "$BLUE_POD" == "NONE" || -z "$BLUE_POD" ]]; then
+            echo "❌ Error: No Blue Pod found!"
+            exit 1
+          fi
+
+          echo "BLUE_POD=$BLUE_POD" >> $GITHUB_ENV
+          echo "GREEN_POD=$GREEN_POD" >> $GITHUB_ENV
+ 
+      - name: Run Health Check on New Deployment
+        run: |
+          if [ "${{ needs.determine-target.outputs.target_color }}" == "green" ]; then
+            if [[ "$GREEN_POD" == "SKIP" ]]; then
+              echo "🚀 No Green Pod yet (first deployment), skipping health check."
+            else
+              echo "Testing Green Deployment..."
+              kubectl exec $GREEN_POD -- curl -s http://localhost:5001/api/health || exit 1
+            fi
+          else
+            echo "Testing Blue Deployment..."
+            kubectl exec $BLUE_POD -- curl -s http://localhost:5001/api/health || exit 1
+          fi
+
+  switch-traffic:
+    runs-on: ubuntu-latest
+    needs: [determine-target, install-velero, test-new]
+    if: success()
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Switch Traffic to New Deployment for all services
+        run: |
+          kubectl patch service catalog-service -p '{"spec":{"selector":{"version":"${{ needs.determine-target.outputs.target_color }}"}}}'
+          kubectl patch service cart-service -p '{"spec":{"selector":{"version":"${{ needs.determine-target.outputs.target_color }}"}}}'
+          kubectl patch service frontend-service -p '{"spec":{"selector":{"version":"${{ needs.determine-target.outputs.target_color }}"}}}'
+
+  cleanup-old:
+    runs-on: ubuntu-latest
+    needs: [determine-target, switch-traffic]
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Scale Down Deployment Based on Idle Color
+        run: |
+          IDLE_COLOR="${{ needs.determine-target.outputs.idle_color }}"
+          
+          if [[ "$IDLE_COLOR" == "green" || "$IDLE_COLOR" == "blue" ]]; then
+            DEPLOYMENT="${IDLE_COLOR}"
+            
+            if kubectl get deployment "$DEPLOYMENT" >/dev/null 2>&1; then
+              echo "📉 Scaling down $DEPLOYMENT..."
+              kubectl scale deployment "$DEPLOYMENT" --replicas=1
+            else
+              echo "⚠️ $DEPLOYMENT not found. Skipping scale down."
+            fi
+          else
+            echo "⚠️ No valid idle color found. Skipping scale down."
+          fi
+
+
+  rollback:
+    runs-on: ubuntu-latest
+    needs: [determine-target, test-new, install-velero]
+    if: ${{ success('determine-target') && (failure('test-new') || failure('install-velero')) }}
+    steps:
+      - name: Restore Kubernetes Context
+        run: |
+          mkdir -p ~/.kube  # Ensure directory exists
+          echo "${{ needs.checkout-and-setup.outputs.kubeconfig }}" | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+          cat ~/.kube/config  # Debugging output to check if it's valid
+ 
+      - name: Download kubeconfig as Artifact (Backup)
+        uses: actions/download-artifact@v4
+        with:
+          name: kubeconfig
+          path: .
+ 
+      - name: Apply kubeconfig from Artifact (If Needed)
+        run: |
+          mkdir -p ~/.kube
+          cat kubeconfig.b64 | base64 --decode > ~/.kube/config
+          export KUBECONFIG=~/.kube/config
+          chmod 600 ~/.kube/config  # Secure kubeconfig file
+
+      - name: Rollback to Previous Version
+        run: |
+          echo "Rolling back to previous version: ${{ needs.determine-target.outputs.idle_color }}"
+          kubectl patch service catalog-service -p '{"spec":{"selector":{"version":"${{ needs.determine-target.outputs.idle_color }}"}}}'
+          kubectl patch service cart-service -p '{"spec":{"selector":{"version":"${{ needs.determine-target.outputs.idle_color }}"}}}'
+          kubectl patch service frontend-service -p '{"spec":{"selector":{"version":"${{ needs.determine-target.outputs.idle_color }}"}}}'
+ 
+      - name: Notify Failure
+        run: echo "Deployment failed. Rolled back to previous version."

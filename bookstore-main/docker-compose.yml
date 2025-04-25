@@ -1,0 +1,53 @@
+version: "3.8"
+ 
+services:
+  postgres:
+    image: postgres:latest
+    container_name: bookstore-db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: bookstore_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+ 
+  catalog:
+    build: ./catalog
+    image: teufelz/bookstore-catalog
+    container_name: catalog-service
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://admin:admin@postgres:5432/bookstore_db
+    ports:
+      - "5001:5001"
+    depends_on:
+      - postgres
+ 
+  cart:
+    build: ./cart
+    image: teufelz/bookstore-cart
+    container_name: cart-service
+    restart: always
+    environment:
+      CART_DATABASE_URL: postgresql://admin:admin@postgres:5432/bookstore_db
+    ports:
+      - "5002:5002"
+    depends_on:
+      - postgres
+ 
+  frontend:
+    build: ./frontend
+    image: teufelz/bookstore-frontend
+    container_name: frontend-app
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - catalog
+      - cart
+ 
+volumes:
+  postgres_data:

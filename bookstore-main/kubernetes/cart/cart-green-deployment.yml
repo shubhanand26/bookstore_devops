@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart-green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cart
+      version: green
+  template:
+    metadata:
+      labels:
+        app: cart
+        version: green
+    spec:
+      containers:
+      - name: cart
+        image: teufelz/bookstore-cart:latest
+        ports:
+        - containerPort: 5002
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi" 
+        env:
+        - name: CART_DATABASE_URL
+          value: postgresql://admin:admin@postgres:5432/bookstore_db
+        livenessProbe:
+          httpGet:
+            path: /api/liveness
+            port: 5002
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3 
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5002
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3 

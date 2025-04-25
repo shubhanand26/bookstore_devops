@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restore-pvc-script
+  namespace: velero
+data:
+  restore-if-pvc-deleted.sh: |
+    #!/bin/bash
+
+    # Define variables
+    VELERO_NAMESPACE="velero"
+    POSTGRES_PVC="postgres-pvc"
+
+    # Get the PV name dynamically based on the PVC name
+    POSTGRES_PV=$(kubectl get pvc $POSTGRES_PVC -n default -o jsonpath='{.spec.volumeName}')
+
+    # Check if the PVC related to Postgres exists
+    PVC_EXISTS=$(kubectl get pvc $POSTGRES_PVC -n default --ignore-not-found)
+
+    # Check if the PV related to Postgres exists
+    PV_EXISTS=$(kubectl get pv $POSTGRES_PV --ignore-not-found)
+
+    # If neither PVC nor PV exists, trigger restore from the latest backup
+    if [[ -z "$PVC_EXISTS" && -z "$PV_EXISTS" ]]; then
+        # Get the name of the most recent backup
+        BACKUP_NAME=$(velero backup get -o custom-columns=":metadata.name" --sort-by='.metadata.creationTimestamp' | tail -n 1)
+
+        # Check if we got a backup name
+        if [ -z "$BACKUP_NAME" ]; then
+            echo "No backups found, cannot restore."
+            exit 1
+        fi
+
+        # Get the Velero pod name
+        VELERO_POD_NAME=$(kubectl get pod -n velero -l app=velero -o jsonpath='{.items[0].metadata.name}')
+
+        # Trigger the restore process
+        kubectl exec -it $VELERO_POD_NAME -n $VELERO_NAMESPACE -- /velero restore create --from-backup $BACKUP_NAME
+
+        echo "Restore process initiated for backup: $BACKUP_NAME"
+    else
+        echo "No need to restore. PVC and PV related to Postgres are still present."
+    fi
